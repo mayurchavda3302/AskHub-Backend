@@ -1,0 +1,270 @@
+Available authorizations
+
+i need just username and password for authorize
+#app/main.py
+from fastapi import FastAPI
+from database import engine, Base
+from auth import models as auth_models
+from qa import models as qa_models
+from auth.routes import router as auth_router
+from qa.routes import router as qa_router
+
+app = FastAPI()
+
+Base.metadata.create_all(bind=engine)
+
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+app.include_router(qa_router, prefix="/qa", tags=["qa"])
+
+#app/database.py
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from config import DATABASE_URL
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+#app/config.py
+DATABASE_URL = "postgresql://mayur:mayur3302@localhost/final_askhub"
+SECRET_KEY = "mayur3302"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+
+#app/auth/models.py
+from sqlalchemy import Column, Integer, String, Boolean
+from database import Base
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    is_active = Column(Boolean, default=True)
+
+
+#app/auth/routes.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from auth import models, schemas, utils
+from database import get_db
+from pydantic import BaseModel
+from datetime import timedelta
+from typing import Optional
+
+router = APIRouter()
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+def get_user(db: Session, email: str):
+    return db.query(models.User).filter(models.User.email == email).first()
+
+def authenticate_user(db: Session, email: str, password: str):
+    user = get_user(db, email)
+    if not user:
+        return False
+    if not utils.verify_password(password, user.hashed_password):
+        return False
+    return user
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    payload = utils.decode_access_token(token)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user = get_user(db, email=payload.get("sub"))
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return user
+
+@router.post("/signup/", response_model=schemas.User)
+def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = get_user(db, email=user.email)
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed_password = utils.hash_password(user.password)
+    new_user = models.User(email=user.email, hashed_password=hashed_password, username=user.username)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+@router.post("/token", response_model=schemas.Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=utils.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = utils.create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@router.get("/users/me/", response_model=schemas.User)
+def read_users_me(current_user: schemas.User = Depends(get_current_user)):
+    return current_user
+
+
+#app/auth/schemas.py
+
+from pydantic import BaseModel, EmailStr
+
+class UserBase(BaseModel):
+    email: EmailStr
+
+class UserCreate(UserBase):
+    password: str
+    username: str
+
+class User(UserBase):
+    id: int
+    username: str
+    is_active: bool
+
+    class Config:
+        from_attributes = True  
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+#app/auth/utils.py
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from config import SECRET_KEY, ALGORITHM
+from datetime import datetime, timedelta
+from typing import Optional
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def decode_access_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+
+#app/qa/models.py
+from sqlalchemy import Column, Integer, String, ForeignKey, Text
+from sqlalchemy.orm import relationship
+from database import Base
+from auth.models import User
+
+class Question(Base):
+    __tablename__ = "questions"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)
+    body = Column(Text, nullable=False)
+    owner_id = Column(Integer, ForeignKey("users.id"))
+    owner = relationship("User", back_populates="questions")
+
+class Answer(Base):
+    __tablename__ = "answers"
+    id = Column(Integer, primary_key=True, index=True)
+    body = Column(Text, nullable=False)
+    question_id = Column(Integer, ForeignKey("questions.id"))
+    owner_id = Column(Integer, ForeignKey("users.id"))
+    owner = relationship("User", back_populates="answers")
+    question = relationship("Question", back_populates="answers")
+
+User.questions = relationship("Question", back_populates="owner")
+User.answers = relationship("Answer", back_populates="owner")
+Question.answers = relationship("Answer", back_populates="question")
+
+#app/qa/routes.py
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from auth import schemas as auth_schemas  # Importing User schema from auth.schemas
+from qa import models, schemas
+from database import get_db
+from auth.routes import get_current_user
+
+router = APIRouter()
+
+@router.post("/questions/", response_model=schemas.Question)
+def create_question(question: schemas.QuestionCreate, db: Session = Depends(get_db), current_user: auth_schemas.User = Depends(get_current_user)):
+    db_question = models.Question(**question.dict(), owner_id=current_user.id)
+    db.add(db_question)
+    db.commit()
+    db.refresh(db_question)
+    return db_question
+
+@router.post("/answers/", response_model=schemas.Answer)
+def create_answer(answer: schemas.AnswerCreate, db: Session = Depends(get_db), current_user: auth_schemas.User = Depends(get_current_user)):
+    db_answer = models.Answer(**answer.dict(), owner_id=current_user.id)
+    db.add(db_answer)
+    db.commit()
+    db.refresh(db_answer)
+    return db_answer
+
+#app/qa/schemas.py
+
+from pydantic import BaseModel
+from typing import List
+
+class AnswerBase(BaseModel):
+    body: str
+
+class AnswerCreate(AnswerBase):
+    question_id: int
+
+class Answer(AnswerBase):
+    id: int
+    owner_id: int
+    question_id: int
+
+    class Config:
+        from_attributes = True  # Use this instead of orm_mode for Pydantic v2
+
+class QuestionBase(BaseModel):
+    title: str
+    body: str
+
+class QuestionCreate(QuestionBase):
+    pass
+
+class Question(QuestionBase):
+    id: int
+    owner_id: int
+    answers: List[Answer] = []
+
+    class Config:
+        from_attributes = True  # Use this instead of orm_mode for Pydantic v2
+
